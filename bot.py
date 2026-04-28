@@ -26,9 +26,12 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+LLM_PROVIDER = os.getenv("LLM_PROVIDER", "openai").lower()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 OPENAI_TRANSCRIBE_MODEL = os.getenv("OPENAI_TRANSCRIBE_MODEL", "gpt-4o-mini-transcribe")
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434/v1")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:7b")
 SYSTEM_PROMPT = os.getenv(
     "SYSTEM_PROMPT",
     "Ты полезный русскоязычный ассистент. Отвечай понятно и по делу.",
@@ -54,7 +57,9 @@ WEBHOOK_SECRET_TOKEN = os.getenv("WEBHOOK_SECRET_TOKEN", "")
 TELEGRAM_PROXY = os.getenv("TELEGRAM_PROXY", "").strip()
 OPENAI_PROXY = os.getenv("OPENAI_PROXY", "").strip()
 OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "").strip()
-if not OPENAI_PROXY and TELEGRAM_PROXY:
+# Для OpenAI можно использовать тот же прокси, но в ollama-режиме локальный
+# endpoint не должен идти через SOCKS/HTTP proxy.
+if LLM_PROVIDER == "openai" and not OPENAI_PROXY and TELEGRAM_PROXY:
     OPENAI_PROXY = TELEGRAM_PROXY
 LOG_FILE = os.getenv("LOG_FILE", "logs/bot.log")
 LOG_MAX_BYTES = int(os.getenv("LOG_MAX_BYTES", str(5 * 1024 * 1024)))
@@ -83,18 +88,25 @@ def configure_logging() -> None:
 
 if not TELEGRAM_BOT_TOKEN:
     raise RuntimeError("Переменная TELEGRAM_BOT_TOKEN не задана")
-if not OPENAI_API_KEY:
-    raise RuntimeError("Переменная OPENAI_API_KEY не задана")
 if TELEGRAM_MODE == "webhook" and not TELEGRAM_WEBHOOK_URL:
     raise RuntimeError("Для режима webhook нужно задать TELEGRAM_WEBHOOK_URL")
+if LLM_PROVIDER not in {"openai", "ollama"}:
+    raise RuntimeError("LLM_PROVIDER должен быть openai или ollama")
+if LLM_PROVIDER == "openai" and not OPENAI_API_KEY:
+    raise RuntimeError("Для LLM_PROVIDER=openai нужно задать OPENAI_API_KEY")
 
-openai_client_kwargs = {"api_key": OPENAI_API_KEY}
+openai_client_kwargs = {
+    "api_key": OPENAI_API_KEY if LLM_PROVIDER == "openai" else "ollama",
+}
 if OPENAI_PROXY:
     openai_client_kwargs["http_client"] = DefaultHttpxClient(proxy=OPENAI_PROXY)
     logger.info("OpenAI proxy enabled")
 if OPENAI_BASE_URL:
     openai_client_kwargs["base_url"] = OPENAI_BASE_URL
     logger.info("OpenAI base URL overridden")
+if LLM_PROVIDER == "ollama" and not OPENAI_BASE_URL:
+    openai_client_kwargs["base_url"] = OLLAMA_BASE_URL
+    logger.info("Using Ollama at %s", OLLAMA_BASE_URL)
 
 client = OpenAI(**openai_client_kwargs)
 
@@ -225,7 +237,7 @@ def build_messages(chat_id: int, user_content: Union[str, List[dict]]) -> List[d
 
 def request_llm_answer(messages: List[dict]) -> str:
     response = client.chat.completions.create(
-        model=OPENAI_MODEL,
+        model=OPENAI_MODEL if LLM_PROVIDER == "openai" else OLLAMA_MODEL,
         messages=messages,
         temperature=0.7,
     )
@@ -299,6 +311,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 def transcribe_voice_file(path: str) -> str:
+    if not OPENAI_API_KEY:
+        return ""
     with open(path, "rb") as audio_file:
         transcript = client.audio.transcriptions.create(
             model=OPENAI_TRANSCRIBE_MODEL,

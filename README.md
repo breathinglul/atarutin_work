@@ -28,9 +28,15 @@ cp .env.example .env
 Заполни `.env`:
 
 - `TELEGRAM_BOT_TOKEN` — токен от BotFather
+- `LLM_PROVIDER` — `openai` или `ollama`
 - `OPENAI_API_KEY` — ключ OpenAI
 - `OPENAI_MODEL` — модель (по умолчанию `gpt-4o-mini`)
 - `SYSTEM_PROMPT` — системная инструкция для бота
+
+Для бесплатного локального режима (Ollama):
+- `LLM_PROVIDER=ollama`
+- `OLLAMA_BASE_URL=http://127.0.0.1:11434/v1`
+- `OLLAMA_MODEL=qwen2.5:7b`
 
 ## 3) Настрой `.env`
 
