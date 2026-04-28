@@ -2,6 +2,7 @@ import base64
 import json
 import logging
 import os
+import urllib.request
 from collections import defaultdict
 from logging.handlers import RotatingFileHandler
 from tempfile import NamedTemporaryFile
@@ -29,12 +30,19 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 LLM_PROVIDER = os.getenv("LLM_PROVIDER", "openai").lower()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-OPENAI_TRANSCRIBE_MODEL = os.getenv("OPENAI_TRANSCRIBE_MODEL", "gpt-4o-mini-transcribe")
+OPENAI_TRANSCRIBE_MODEL = os.getenv("OPENAI_TRANSCRIBE_MODEL", "whisper-1")
+OPENAI_TRANSCRIBE_BASE_URL = os.getenv("OPENAI_TRANSCRIBE_BASE_URL", "").strip()
+OPENAI_TRANSCRIBE_PROXY = os.getenv("OPENAI_TRANSCRIBE_PROXY", "").strip()
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434/v1")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:7b")
+OLLAMA_VISION_MODEL = os.getenv("OLLAMA_VISION_MODEL", "llava:7b")
 SYSTEM_PROMPT = os.getenv(
     "SYSTEM_PROMPT",
     "Ты полезный русскоязычный ассистент. Отвечай понятно и по делу.",
+)
+LANGUAGE_GUARD_PROMPT = os.getenv(
+    "LANGUAGE_GUARD_PROMPT",
+    "Отвечай строго на русском языке. Не используй китайский или другие языки, если пользователь явно не попросил.",
 )
 MAX_HISTORY_MESSAGES = int(os.getenv("MAX_HISTORY_MESSAGES", "20"))
 HISTORY_BACKEND = os.getenv("HISTORY_BACKEND", "memory").lower()
@@ -61,6 +69,8 @@ OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "").strip()
 # endpoint не должен идти через SOCKS/HTTP proxy.
 if LLM_PROVIDER == "openai" and not OPENAI_PROXY and TELEGRAM_PROXY:
     OPENAI_PROXY = TELEGRAM_PROXY
+if not OPENAI_TRANSCRIBE_PROXY:
+    OPENAI_TRANSCRIBE_PROXY = OPENAI_PROXY or TELEGRAM_PROXY
 LOG_FILE = os.getenv("LOG_FILE", "logs/bot.log")
 LOG_MAX_BYTES = int(os.getenv("LOG_MAX_BYTES", str(5 * 1024 * 1024)))
 LOG_BACKUP_COUNT = int(os.getenv("LOG_BACKUP_COUNT", "3"))
@@ -109,6 +119,18 @@ if LLM_PROVIDER == "ollama" and not OPENAI_BASE_URL:
     logger.info("Using Ollama at %s", OLLAMA_BASE_URL)
 
 client = OpenAI(**openai_client_kwargs)
+
+transcribe_client = None
+if OPENAI_API_KEY:
+    transcribe_client_kwargs = {"api_key": OPENAI_API_KEY}
+    if OPENAI_TRANSCRIBE_BASE_URL:
+        transcribe_client_kwargs["base_url"] = OPENAI_TRANSCRIBE_BASE_URL
+    elif OPENAI_BASE_URL and LLM_PROVIDER == "openai":
+        transcribe_client_kwargs["base_url"] = OPENAI_BASE_URL
+    if OPENAI_TRANSCRIBE_PROXY:
+        transcribe_client_kwargs["http_client"] = DefaultHttpxClient(proxy=OPENAI_TRANSCRIBE_PROXY)
+        logger.info("Transcribe proxy enabled")
+    transcribe_client = OpenAI(**transcribe_client_kwargs)
 
 
 class HistoryStore:
@@ -232,7 +254,12 @@ def is_user_allowed(update: Update) -> bool:
 
 def build_messages(chat_id: int, user_content: Union[str, List[dict]]) -> List[dict]:
     history = history_store.get_history(chat_id)
-    return [{"role": "system", "content": SYSTEM_PROMPT}, *history, {"role": "user", "content": user_content}]
+    return [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "system", "content": LANGUAGE_GUARD_PROMPT},
+        *history,
+        {"role": "user", "content": user_content},
+    ]
 
 
 def request_llm_answer(messages: List[dict]) -> str:
@@ -311,15 +338,51 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 def transcribe_voice_file(path: str) -> str:
-    if not OPENAI_API_KEY:
+    if not transcribe_client:
         return ""
     with open(path, "rb") as audio_file:
-        transcript = client.audio.transcriptions.create(
-            model=OPENAI_TRANSCRIBE_MODEL,
-            file=audio_file,
-        )
+        try:
+            transcript = transcribe_client.audio.transcriptions.create(
+                model=OPENAI_TRANSCRIBE_MODEL,
+                file=audio_file,
+            )
+        except Exception as exc:
+            # Fallback to Whisper in case custom model is not available.
+            try:
+                transcript = transcribe_client.audio.transcriptions.create(
+                    model="whisper-1",
+                    file=audio_file,
+                )
+            except Exception:
+                raise RuntimeError(str(exc)) from exc
     text = getattr(transcript, "text", None)
     return text.strip() if text else ""
+
+
+def request_ollama_vision_answer(caption: str, photo_bytes: bytes) -> str:
+    task = caption or "Опиши изображение."
+    prompt = (
+        "Ты анализируешь изображение. Отвечай только на русском.\n"
+        "Правила:\n"
+        "1) Не выдумывай текст на изображении.\n"
+        "2) Если надпись неразборчива, так и напиши: 'Текст неразборчив'.\n"
+        "3) Если текст читается частично, процитируй только читаемые фрагменты в кавычках.\n"
+        "4) Затем кратко опиши, что еще видно на фото.\n"
+        f"Задача пользователя: {task}"
+    )
+    payload = {
+        "model": OLLAMA_VISION_MODEL,
+        "prompt": prompt,
+        "images": [base64.b64encode(photo_bytes).decode("utf-8")],
+        "stream": False,
+        "options": {"temperature": 0.2},
+    }
+    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    url = OLLAMA_BASE_URL.removesuffix("/v1") + "/api/generate"
+    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=120) as resp:
+        body = json.loads(resp.read().decode("utf-8"))
+    return (body.get("response") or "").strip() or "Не удалось получить ответ по изображению."
 
 
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -345,6 +408,22 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
         await update.message.reply_text(f"Распознал: {transcribed}")
         await process_prompt(update, context, transcribed, f"[VOICE] {transcribed}")
+    except RuntimeError as exc:
+        err = str(exc)
+        logger.exception("Voice transcription failed: %s", err)
+        if "insufficient_quota" in err:
+            await update.message.reply_text(
+                "Распознавание голоса недоступно: у OpenAI закончилась квота (429 insufficient_quota). "
+                "Пополни биллинг OpenAI или укажи совместимый STT endpoint в OPENAI_TRANSCRIBE_BASE_URL."
+            )
+            return
+        if "unsupported_country_region_territory" in err:
+            await update.message.reply_text(
+                "Распознавание голоса недоступно в текущем регионе (403). "
+                "Проверь OPENAI_TRANSCRIBE_PROXY/OPENAI_PROXY или используй другой STT endpoint."
+            )
+            return
+        await update.message.reply_text("Ошибка распознавания голосового сообщения.")
     except Exception as exc:  # noqa: BLE001
         logger.exception("Voice handling failed: %s", exc)
         await update.message.reply_text("Ошибка при обработке голосового сообщения.")
@@ -352,7 +431,12 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 def build_vision_user_content(caption: str, photo_bytes: bytes) -> List[dict]:
     encoded = base64.b64encode(photo_bytes).decode("utf-8")
-    prompt_text = caption or "Опиши, что на изображении, и ответь полезно."
+    task = caption or "Опиши изображение."
+    prompt_text = (
+        "Проанализируй изображение. Отвечай только на русском. "
+        "Не выдумывай надписи: если текст не читается, так и напиши. "
+        f"Задача: {task}"
+    )
     return [
         {"type": "text", "text": prompt_text},
         {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{encoded}"}},
@@ -375,8 +459,15 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         file = await context.bot.get_file(largest_photo.file_id)
         photo_bytes = await file.download_as_bytearray()
         caption = (update.message.caption or "").strip()
-        user_content = build_vision_user_content(caption, bytes(photo_bytes))
         history_note = f"[PHOTO] caption={caption}" if caption else "[PHOTO]"
+        if LLM_PROVIDER == "ollama":
+            answer = request_ollama_vision_answer(caption, bytes(photo_bytes))
+            history_store.append(chat_id, "user", history_note)
+            history_store.append(chat_id, "assistant", answer)
+            await update.message.reply_text(answer)
+            return
+
+        user_content = build_vision_user_content(caption, bytes(photo_bytes))
         await process_prompt(update, context, user_content, history_note)
     except Exception as exc:  # noqa: BLE001
         logger.exception("Photo handling failed: %s", exc)
