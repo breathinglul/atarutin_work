@@ -1,0 +1,18 @@
+[Unit]
+Description=Telegram AI Bot
+After=network.target
+
+[Service]
+Type=simple
+User=www-data
+Group=www-data
+WorkingDirectory=/opt/telegram-ai-bot
+EnvironmentFile=/opt/telegram-ai-bot/.env
+ExecStart=/opt/telegram-ai-bot/.venv/bin/python /opt/telegram-ai-bot/bot.py
+Restart=always
+RestartSec=5
+KillSignal=SIGINT
+TimeoutStopSec=20
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,5 @@
+openai
+python-dotenv
+python-telegram-bot
+redis
+psycopg2-binary
